@@ -1,0 +1,408 @@
+"""
+leer_carpetas.py
+
+Lógica del Verificador de Anuncios: localiza la carpeta de la semana,
+busca un artículo en TODOS los PDFs de esa semana (con respaldo de OCR
+para páginas escaneadas), y permite descargar la página encontrada.
+
+Estructura esperada:
+    ADS/
+      ├─ Wk-52/
+      │    ├─ anuncio1.pdf
+      │    └─ anuncio2.pdf   (puede haber más de uno por semana)
+      └─ Wk-53/
+           └─ anuncio.pdf
+"""
+
+from pathlib import Path
+import re
+import pymupdf as fitz  # PyMuPDF, para abrir y leer archivos PDF
+
+# EasyOCR: se instala solo con 'pip install easyocr', sin necesitar ningún
+# programa aparte ni permisos de administrador (a diferencia de Tesseract).
+# La primera vez que se usa, descarga sus modelos de reconocimiento
+# (puede tardar uno o dos minutos); las siguientes veces es instantáneo.
+
+# Extensión de los archivos de anuncio. Todos son PDF.
+EXTENSION_ANUNCIO = ".pdf"
+
+# Calidad de la imagen que se genera al extraer una página del PDF.
+# 200 es un buen balance entre nitidez y tamaño de archivo.
+RESOLUCION_DPI = 200
+
+# Carpeta donde se guardan las páginas extraídas. Usamos la ubicación del
+# propio script (no una ruta relativa) para que SIEMPRE se cree en el mismo
+# lugar, sin importar desde qué carpeta esté parada la terminal cuando lo
+# corras (ej. VS Code a veces abre la terminal en una carpeta distinta a
+# donde está el archivo .py).
+CARPETA_SALIDA_DEFECTO = str(Path(__file__).resolve().parent / "paginas_extraidas")
+
+
+# ---------------------------------------------------------------------------
+# PARTE 1: Buscar la carpeta del año, y luego la de la semana
+# ---------------------------------------------------------------------------
+def listar_subcarpetas_numericas(carpeta):
+    """Devuelve los nombres de las subcarpetas que tengan al menos un
+    número en el nombre (sirve tanto para años como para semanas — un año
+    como '2025' y una semana como 'Wk-52' ambos tienen números). Ignora
+    carpetas sin número, como '__pycache__' o 'paginas_extraidas'."""
+    base = Path(carpeta)
+    if not base.exists():
+        print(f"⚠ La carpeta no existe: {carpeta}")
+        return []
+
+    nombres = [p.name for p in base.iterdir() if p.is_dir()]
+    con_numero = [n for n in nombres if re.findall(r"\d+", n)]
+    return sorted(con_numero)
+
+
+def buscar_subcarpeta_por_numero(carpeta, numero_buscado):
+    """Busca, dentro de 'carpeta', la subcarpeta cuyo nombre contenga el
+    número pedido (sirve igual para buscar un año o una semana). Devuelve
+    el nombre de la carpeta encontrada, o None si no la encuentra."""
+    subcarpetas = listar_subcarpetas_numericas(carpeta)
+    numeros_buscados = re.findall(r"\d+", numero_buscado)
+
+    for sub in subcarpetas:
+        numeros_sub = re.findall(r"\d+", sub)
+        if numeros_buscados and numeros_buscados[0] in numeros_sub:
+            return sub
+
+    return None
+
+
+def listar_carpetas_anio(carpeta_base):
+    """Devuelve los años disponibles (ej. ['2019', '2020', ..., '2026'])
+    dentro de la carpeta base (la carpeta 'Weekly Ads', o su acceso
+    directo)."""
+    return listar_subcarpetas_numericas(carpeta_base)
+
+
+def buscar_carpeta_anio(carpeta_base, anio_buscado):
+    """Busca la carpeta del año pedido (ej. '2025') dentro de la carpeta
+    base. Devuelve el nombre de la carpeta, o None si no existe."""
+    return buscar_subcarpeta_por_numero(carpeta_base, anio_buscado)
+
+
+def listar_carpetas_semana(carpeta_anio):
+    """Devuelve los nombres de las subcarpetas que parecen ser semanas
+    (ej. ["Wk-52", "Wk-53"]) dentro de la carpeta de un año específico.
+    Ignora carpetas que no tengan ningún número en el nombre."""
+    return listar_subcarpetas_numericas(carpeta_anio)
+
+
+def buscar_carpeta_semana(carpeta_anio, semana_buscada):
+    """Busca, dentro de la carpeta del año, la subcarpeta que corresponde a
+    la semana pedida (ej. '52', 'Wk-52', 'Semana 52'). Devuelve el nombre
+    de la carpeta encontrada, o None si no la encuentra."""
+    return buscar_subcarpeta_por_numero(carpeta_anio, semana_buscada)
+
+
+# ---------------------------------------------------------------------------
+# PARTE 2: Encontrar el/los PDF(s) del anuncio dentro de esa carpeta
+# ---------------------------------------------------------------------------
+def listar_pdfs_en_carpeta(ruta_carpeta_semana):
+    """Devuelve TODOS los archivos PDF dentro de la carpeta de la semana,
+    no solo el primero. Útil cuando una misma semana tiene varios anuncios
+    (ej. uno por tipo de tienda o banner). No asume ningún número fijo de
+    PDFs — se adapta a los que encuentre."""
+    carpeta = Path(ruta_carpeta_semana)
+    if not carpeta.exists():
+        print(f"⚠ La carpeta de la semana no existe: {ruta_carpeta_semana}")
+        return []
+    return sorted(carpeta.glob(f"*{EXTENSION_ANUNCIO}"))
+
+
+# ---------------------------------------------------------------------------
+# PARTE 3: Abrir el PDF y extraer una página (como imagen o como PDF)
+# ---------------------------------------------------------------------------
+def extraer_pagina_como_imagen(ruta_pdf, numero_pagina, carpeta_salida=CARPETA_SALIDA_DEFECTO):
+    """Abre el PDF, va a la página indicada (numeración empieza en 1) y la
+    guarda como archivo .png. Devuelve la ruta del archivo generado, o
+    None si algo falla."""
+    documento = fitz.open(ruta_pdf)
+
+    total_paginas = documento.page_count
+    indice = numero_pagina - 1
+
+    if indice < 0 or indice >= total_paginas:
+        print(f"⚠ El PDF tiene {total_paginas} páginas; la página {numero_pagina} no existe.")
+        documento.close()
+        return None
+
+    pagina = documento.load_page(indice)
+
+    zoom = RESOLUCION_DPI / 72
+    matriz = fitz.Matrix(zoom, zoom)
+    pixmap = pagina.get_pixmap(matrix=matriz)
+
+    Path(carpeta_salida).mkdir(exist_ok=True)
+    nombre_archivo = f"{Path(ruta_pdf).stem}_pagina_{numero_pagina}.png"
+    ruta_salida = str(Path(carpeta_salida) / nombre_archivo)
+
+    pixmap.save(ruta_salida)
+    documento.close()
+
+    return ruta_salida
+
+
+def extraer_pagina_como_pdf(ruta_pdf, numero_pagina, carpeta_salida=CARPETA_SALIDA_DEFECTO):
+    """Igual que extraer_pagina_como_imagen, pero el resultado es un PDF de
+    una sola página en vez de un .png. En vez de copiar la página original
+    del PDF (que puede dar problemas de páginas en blanco con algunos
+    diseños), renderizamos la página como imagen de alta calidad — igual
+    que en extraer_pagina_como_imagen — y la insertamos dentro de un PDF
+    nuevo. Esto es más confiable, aunque el texto deja de ser seleccionable
+    (queda como una foto dentro del PDF, no como texto)."""
+
+    documento = fitz.open(ruta_pdf)
+    indice = numero_pagina - 1
+
+    if indice < 0 or indice >= documento.page_count:
+        print(f"⚠ El PDF tiene {documento.page_count} páginas; la página {numero_pagina} no existe.")
+        documento.close()
+        return None
+
+    pagina_original = documento.load_page(indice)
+
+    zoom = RESOLUCION_DPI / 72
+    matriz = fitz.Matrix(zoom, zoom)
+    pixmap = pagina_original.get_pixmap(matrix=matriz)
+
+    nuevo_pdf = fitz.open()
+    nueva_pagina = nuevo_pdf.new_page(
+        width=pagina_original.rect.width,
+        height=pagina_original.rect.height,
+    )
+    nueva_pagina.insert_image(nueva_pagina.rect, pixmap=pixmap)
+
+    Path(carpeta_salida).mkdir(exist_ok=True)
+    nombre_archivo = f"{Path(ruta_pdf).stem}_pagina_{numero_pagina}.pdf"
+    ruta_salida = str(Path(carpeta_salida) / nombre_archivo)
+
+    nuevo_pdf.save(ruta_salida)
+    nuevo_pdf.close()
+    documento.close()
+
+    return ruta_salida
+
+
+# ---------------------------------------------------------------------------
+# PARTE 4: Buscar el artículo dentro de un PDF — texto real, y con OCR
+# ---------------------------------------------------------------------------
+def buscar_articulo_en_pdf(ruta_pdf, articulo_buscado):
+    """Recorre TODAS las páginas del PDF buscando el texto del artículo,
+    usando solo el texto real (rápido). Devuelve una lista con los números
+    de página (empezando en 1) donde aparece ese texto."""
+
+    documento = fitz.open(ruta_pdf)
+    # Normalizamos: colapsamos saltos de línea y espacios repetidos, porque
+    # los anuncios suelen partir el nombre de un producto en varias líneas
+    # por el diseño, y sin esto la frase completa nunca coincidiría.
+    articulo_normalizado = re.sub(r"\s+", " ", articulo_buscado.strip().lower())
+    paginas_encontradas = []
+
+    for indice in range(documento.page_count):
+        pagina = documento.load_page(indice)
+        texto_pagina = pagina.get_text()
+        texto_normalizado = re.sub(r"\s+", " ", texto_pagina).lower()
+
+        if articulo_normalizado in texto_normalizado:
+            numero_pagina = indice + 1
+            paginas_encontradas.append(numero_pagina)
+
+    documento.close()
+    return paginas_encontradas
+
+
+# El "lector" de EasyOCR es costoso de crear (carga modelos en memoria), así
+# que lo creamos UNA sola vez y lo reutilizamos — no en cada página.
+_lector_ocr = None
+
+
+def _obtener_lector_ocr():
+    """Crea (solo la primera vez) el lector de EasyOCR, configurado para
+    reconocer inglés y español. Las siguientes llamadas reutilizan el mismo
+    lector, para no recargar los modelos en cada búsqueda."""
+    global _lector_ocr
+    if _lector_ocr is None:
+        import easyocr
+        print("Cargando el modelo de OCR (solo la primera vez, puede tardar 1-2 minutos)...")
+        _lector_ocr = easyocr.Reader(["en", "es"], gpu=False)
+    return _lector_ocr
+
+
+def _extraer_texto_pagina_con_ocr(pagina, idioma=None):
+    """Convierte una página del PDF en imagen y le aplica OCR con EasyOCR
+    para extraer su texto. Se usa solo cuando la página no tiene texto real
+    (es decir, es una imagen/escaneo), o cuando el producto buscado no
+    aparece en el texto real de una página que sí tiene otro contenido.
+    (El parámetro 'idioma' se deja por compatibilidad, pero EasyOCR usa los
+    idiomas configurados al crear el lector, no por llamada)."""
+    import numpy as np
+    from PIL import Image
+    import io
+
+    zoom = 300 / 72
+    matriz = fitz.Matrix(zoom, zoom)
+    pixmap = pagina.get_pixmap(matrix=matriz)
+
+    imagen = Image.open(io.BytesIO(pixmap.tobytes("png")))
+    lector = _obtener_lector_ocr()
+    fragmentos_texto = lector.readtext(np.array(imagen), detail=0)
+    return " ".join(fragmentos_texto)
+
+
+def buscar_articulo_en_pdf_con_ocr(ruta_pdf, articulo_buscado, idioma_ocr="spa+eng", detener_al_encontrar=True):
+    """Versión mejorada de buscar_articulo_en_pdf: para cada página primero
+    intenta el texto real (rápido). Si no lo encuentra ahí, intenta también
+    con OCR sobre esa misma página — incluso si la página ya tiene bastante
+    texto real de otros productos, porque un producto individual puede
+    estar incrustado como imagen dentro de una página que por lo demás es
+    texto normal.
+
+    Por defecto (detener_al_encontrar=True), deja de revisar páginas en
+    cuanto encuentra la primera coincidencia — así no gasta tiempo haciendo
+    OCR en el resto del PDF si el producto ya apareció. Pon
+    detener_al_encontrar=False si quieres encontrar TODAS las páginas donde
+    aparece dentro de este mismo PDF (por ejemplo, si un producto puede
+    estar listado más de una vez en el mismo anuncio).
+
+    Devuelve una lista de tuplas (numero_pagina, via) donde 'via' indica si
+    se encontró por texto real ("texto") o por OCR ("ocr")."""
+
+    documento = fitz.open(ruta_pdf)
+    articulo_normalizado = re.sub(r"\s+", " ", articulo_buscado.strip().lower())
+    paginas_encontradas = []
+    total_paginas = documento.page_count
+
+    for indice in range(total_paginas):
+        pagina = documento.load_page(indice)
+        numero_pagina = indice + 1
+
+        texto_real = pagina.get_text()
+        texto_normalizado = re.sub(r"\s+", " ", texto_real).lower()
+
+        if articulo_normalizado in texto_normalizado:
+            paginas_encontradas.append((numero_pagina, "texto"))
+            if detener_al_encontrar:
+                break
+            continue
+
+        # Avisamos por consola antes de cada página con OCR, porque puede
+        # tardar 10-30 segundos por página con CPU — sin este mensaje,
+        # parece que el programa se quedó pegado, aunque sí está trabajando.
+        print(f"   Analizando página {numero_pagina}/{total_paginas} con OCR (puede tardar)...")
+        texto_ocr = _extraer_texto_pagina_con_ocr(pagina, idioma_ocr)
+        texto_ocr_normalizado = re.sub(r"\s+", " ", texto_ocr).lower()
+
+        if articulo_normalizado in texto_ocr_normalizado:
+            paginas_encontradas.append((numero_pagina, "ocr"))
+            if detener_al_encontrar:
+                break
+
+    documento.close()
+    return paginas_encontradas
+
+
+# ---------------------------------------------------------------------------
+# PARTE 4B: Buscar el artículo en TODOS los PDFs de la carpeta de la semana
+# ---------------------------------------------------------------------------
+def buscar_articulo_en_carpeta(ruta_carpeta_semana, articulo_buscado, usar_ocr=True, extraer_automaticamente=True, detener_en_toda_la_carpeta=True):
+    """Busca el artículo en los PDFs dentro de la carpeta de la semana —
+    sin importar si hay 1, 3 o 20 PDFs, esto se adapta solo.
+
+    Para que sea rápido incluso con muchos PDFs, busca en DOS pasadas:
+      1) Primero, texto real en los PDFs (rápido).
+      2) Solo si no apareció por texto en ninguno, hace una segunda pasada
+         más lenta usando OCR.
+
+    Si detener_en_toda_la_carpeta=True (por defecto), en cuanto encuentra
+    la PRIMERA coincidencia en cualquier PDF, se detiene por completo — ya
+    no revisa el resto de los PDFs de la carpeta. Pon
+    detener_en_toda_la_carpeta=False si en cambio quieres ver TODOS los
+    PDFs/banners donde aparece el producto.
+
+    Si extraer_automaticamente=True (por defecto), en cuanto encuentra una
+    coincidencia, descarga esa página COMO PDF de inmediato.
+
+    Devuelve una lista de tuplas (nombre_del_pdf, numero_pagina, via) — con
+    un solo elemento si detener_en_toda_la_carpeta=True y encontró algo."""
+
+    pdfs = listar_pdfs_en_carpeta(ruta_carpeta_semana)
+    resultados = []
+
+    def _procesar_coincidencia(nombre_pdf, numero_pagina, via):
+        resultados.append((nombre_pdf, numero_pagina, via))
+        if extraer_automaticamente:
+            ruta_pdf_completa = str(Path(ruta_carpeta_semana) / nombre_pdf)
+            ruta_extraida = extraer_pagina_como_pdf(ruta_pdf_completa, numero_pagina)
+            if ruta_extraida:
+                print(f"✅ {nombre_pdf} · página {numero_pagina} (vía: {via}) → guardada en: {ruta_extraida}")
+
+    # --- Pasada 1: texto real ---
+    for ruta_pdf in pdfs:
+        print(f"Buscando (texto) en: {ruta_pdf.name}...")
+        paginas = buscar_articulo_en_pdf(str(ruta_pdf), articulo_buscado)
+        for numero_pagina in paginas:
+            _procesar_coincidencia(ruta_pdf.name, numero_pagina, "texto")
+            if detener_en_toda_la_carpeta:
+                return resultados
+
+    if resultados or not usar_ocr:
+        return resultados
+
+    # --- Pasada 2: OCR, solo si no apareció por texto en ningún PDF ---
+    print("No se encontró por texto en ningún PDF — probando con OCR (esto tarda más)...")
+    for ruta_pdf in pdfs:
+        print(f"Buscando (OCR) en: {ruta_pdf.name}...")
+        coincidencias = buscar_articulo_en_pdf_con_ocr(str(ruta_pdf), articulo_buscado)
+        for numero_pagina, via in coincidencias:
+            _procesar_coincidencia(ruta_pdf.name, numero_pagina, via)
+            if detener_en_toda_la_carpeta:
+                return resultados
+
+    return resultados
+
+
+# ---------------------------------------------------------------------------
+# PARTE 5: Programa interactivo — pide semana y artículo al usuario
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    # 👇 Ajusta esta ruta a tu carpeta real en la empresa
+    carpeta_base = r"X:\Winn-Dixie\Weekly Ads"
+
+    anio_buscado = input("Escribe el año (ej. 2025): ").strip()
+    semana_buscada = input("Escribe el número de la semana (ej. 52): ").strip()
+    articulo_buscado = input("Escribe el nombre del artículo a buscar: ").strip()
+
+    print(f"\nBuscando carpeta para el año '{anio_buscado}'...")
+    nombre_anio = buscar_carpeta_anio(carpeta_base, anio_buscado)
+
+    if not nombre_anio:
+        print("❌ No se encontró la carpeta de ese año.")
+        print("Años disponibles:", listar_carpetas_anio(carpeta_base))
+    else:
+        print(f"✅ Año encontrado: {nombre_anio}")
+        ruta_carpeta_anio = str(Path(carpeta_base) / nombre_anio)
+
+        print(f"Buscando carpeta para la semana '{semana_buscada}'...")
+        nombre_carpeta = buscar_carpeta_semana(ruta_carpeta_anio, semana_buscada)
+
+        if not nombre_carpeta:
+            print("❌ No se encontró la carpeta de esa semana.")
+            print("Semanas disponibles:", listar_carpetas_semana(ruta_carpeta_anio))
+        else:
+            print(f"✅ Semana encontrada: {nombre_carpeta}")
+            ruta_carpeta_semana = str(Path(ruta_carpeta_anio) / nombre_carpeta)
+
+            print(f"Buscando '{articulo_buscado}' en TODOS los PDFs de esa semana (con respaldo de OCR)...")
+            print("(Cada página se descarga apenas se encuentra, sin esperar a revisar el resto de la carpeta)\n")
+            resultados = buscar_articulo_en_carpeta(ruta_carpeta_semana, articulo_buscado, usar_ocr=True)
+
+            if not resultados:
+                print(f"❌ No se encontró '{articulo_buscado}' en ningún PDF de esa semana (ni por texto ni por OCR).")
+            else:
+                print(f"\n✅ Resumen — encontrado en {len(resultados)} lugar(es):")
+                for nombre_pdf, numero_pagina, via in resultados:
+                    print(f"   - {nombre_pdf} · página {numero_pagina} (vía: {via})")
